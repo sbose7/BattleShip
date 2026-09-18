@@ -1,29 +1,49 @@
 package JobProcessing;
 
-import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * The single coordinator. Holds zero to many registered consumers and routes
- * each submitted job to the first consumer that handles its type.
+ * The single coordinator. Holds zero to many registered consumers per job
+ * type and routes each submitted job to one of them, round-robin. Safe to
+ * call register/unregister/submit concurrently from multiple threads.
  */
 public class Coordinator {
-    private final List<Consumer> consumers = new ArrayList<>();
+    private final Map<JobType, List<Consumer>> consumersByType = new ConcurrentHashMap<>();
+    private final Map<JobType, AtomicInteger> roundRobinCounters = new ConcurrentHashMap<>();
 
     public void register(Consumer consumer) {
-        consumers.add(consumer);
+        consumersByType
+                .computeIfAbsent(consumer.getJobType(), type -> new CopyOnWriteArrayList<>())
+                .add(consumer);
+        roundRobinCounters.computeIfAbsent(consumer.getJobType(), type -> new AtomicInteger());
     }
 
     public void unregister(Consumer consumer) {
-        consumers.remove(consumer);
+        List<Consumer> consumers = consumersByType.get(consumer.getJobType());
+        if (consumers != null) {
+            consumers.remove(consumer);
+        }
     }
 
-    public String submit(Job job) {
-        for (Consumer consumer : consumers) {
-            if (consumer.getJobType() == job.getType()) {
-                return consumer.process(job);
-            }
+    /** Empty when no consumer is registered for the job's type. */
+    public Optional<String> submit(Job job) {
+        List<Consumer> consumers = consumersByType.get(job.getType());
+        if (consumers == null) {
+            return Optional.empty();
         }
-        throw new IllegalStateException("No consumer registered for job type " + job.getType());
+        // Snapshot so the size and the picked element always agree, even if
+        // another thread registers/unregisters a consumer concurrently.
+        Consumer[] snapshot = consumers.toArray(new Consumer[0]);
+        if (snapshot.length == 0) {
+            return Optional.empty();
+        }
+        AtomicInteger counter = roundRobinCounters.get(job.getType());
+        int index = Math.floorMod(counter.getAndIncrement(), snapshot.length);
+        return Optional.of(snapshot[index].process(job));
     }
 }
